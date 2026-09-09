@@ -1,0 +1,77 @@
+name: Blocklist bundle
+
+# Upstream lists refresh daily, so this rebuilds and republishes a signed bundle daily.
+# The app checks a small manifest and pulls a delta, so a normal day costs a few hundred KB
+# rather than re-downloading the whole index.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blocklist-bundle
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install signing dependency
+        run: pip install --quiet cryptography
+
+      - name: Fetch previous bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          PREV_TAG=$(gh release list --limit 100 --json tagName \
+            -q '[.[].tagName | select(startswith("bundle-"))] | sort | last // ""')
+          echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "previous release: $PREV_TAG"
+            echo "PREV_VERSION=${PREV_TAG#bundle-}" >> "$GITHUB_ENV"
+            gh release download "$PREV_TAG" --dir previous --pattern 'index-*.bin' || true
+          else
+            echo "no previous bundle — this will be a full build"
+            echo "PREV_VERSION=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and sign bundle
+        env:
+          BUNDLE_SIGNING_KEY: ${{ secrets.BUNDLE_SIGNING_KEY }}
+        run: |
+          PREV_INDEX=$(ls previous/index-*.bin 2>/dev/null | head -1 || true)
+          python tools/build_bundle.py \
+            --out out \
+            --previous-version "${PREV_VERSION:-0}" \
+            ${PREV_INDEX:+--previous-index "$PREV_INDEX"}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(python -c "import json;print(json.load(open('out/manifest.json'))['version'])")
+          DOMAINS=$(python -c "import json;print(f\"{json.load(open('out/manifest.json'))['domains']:,}\")")
+
+          gh release create "bundle-$VERSION" out/* \
+            --title "Blocklist bundle $VERSION" \
+            --notes "$DOMAINS domains. Signed manifest; verify manifest.json.sig against the pinned public key."
+
+      # A failed build must never leave the app without a list. It simply keeps the previous
+      # release, because nothing was published.
+      - name: Report
+        if: failure()
+        run: echo "Bundle build failed. Previous release remains current; devices keep their existing list."
