@@ -74,6 +74,58 @@ IGNORED = {
     "0.0.0.0",
 }
 
+# Public DNS resolver addresses the app routes into its VPN tunnel and answers directly, so an
+# app/browser that hard-codes one of these (instead of using the device's normal DNS path) still
+# gets filtered answers rather than bypassing everything. Moved here from a hardcoded APK constant
+# 2026-09-10 (Guard's Phase 11 adversarial suite, finding B2) specifically so it can grow over time
+# via this same daily pipeline instead of needing an app release. The app unions this with its own
+# small built-in seed list (ResolverPolicy.SEED in the app repo) — this list only ever adds to that
+# floor, never replaces it, so a bad or missing bundle can't shrink coverage below the seed.
+#
+# Kept in sync manually with the app's seed list for now, not auto-derived from it — the two repos
+# are deliberately independent (this one is public, the app's is private) and the overlap is a
+# reasonable duplication of a short, rarely-changing list rather than a build-time coupling between
+# them.
+RESOLVERS = [
+    # Google
+    "8.8.8.8", "8.8.4.4",
+    # Cloudflare, including the family-filter variants
+    "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
+    # Quad9
+    "9.9.9.9", "9.9.9.10", "9.9.9.11", "149.112.112.112", "149.112.112.9",
+    # OpenDNS / Cisco
+    "208.67.222.222", "208.67.220.220", "208.67.222.123", "208.67.220.123",
+    # AdGuard
+    "94.140.14.14", "94.140.15.15", "94.140.14.15", "94.140.15.16",
+    # CleanBrowsing
+    "185.228.168.9", "185.228.169.9", "185.228.168.10", "185.228.169.11",
+    # NextDNS
+    "45.90.28.0", "45.90.30.0",
+    # Comodo
+    "8.26.56.26", "8.20.247.20",
+    # Verisign
+    "64.6.64.6", "64.6.65.6",
+    # DNS.WATCH
+    "84.200.69.80", "84.200.70.40",
+    # Mullvad
+    "194.242.2.2", "194.242.2.4",
+    # ControlD
+    "76.76.2.0", "76.76.10.0",
+    # Level3 — deliberately including the secondaries the app's own seed list does not (.3/.4/.5/.6),
+    # since the app already covers .1/.2; this is the first real "grown since the seed" entry.
+    "4.2.2.1", "4.2.2.2", "4.2.2.3", "4.2.2.4", "4.2.2.5", "4.2.2.6",
+    # Yandex
+    "77.88.8.8", "77.88.8.1",
+    # DNS.SB
+    "185.222.222.222", "45.11.45.11",
+    # Alternate DNS
+    "76.76.19.19", "76.223.122.150",
+    # Digitale Gesellschaft (Switzerland) — the specific non-mainstream provider used to
+    # demonstrate the bypass live during the adversarial suite; added precisely because it's the
+    # kind of provider that isn't in any browser's built-in dropdown but is one search away.
+    "185.95.218.42", "185.95.218.43",
+]
+
 
 def fnv1a64(host: str) -> int:
     """Must stay byte-for-byte identical to DomainBlocklist.hash() in the app."""
@@ -224,6 +276,11 @@ def main() -> int:
     index_name = f"index-{version}.bin"
     write_index(args.out / index_name, current, version)
 
+    resolvers_name = "resolvers.json"
+    resolvers_path = args.out / resolvers_name
+    resolvers_path.write_text(json.dumps(RESOLVERS, indent=2))
+    print(f"resolvers: {len(RESOLVERS)} addresses", flush=True)
+
     manifest = {
         "version": version,
         "created": datetime.now(timezone.utc).isoformat(),
@@ -233,6 +290,12 @@ def main() -> int:
             "name": index_name,
             "size": (args.out / index_name).stat().st_size,
             "sha256": sha256(args.out / index_name),
+        },
+        "resolvers": {
+            "name": resolvers_name,
+            "count": len(RESOLVERS),
+            "size": resolvers_path.stat().st_size,
+            "sha256": sha256(resolvers_path),
         },
         "sources": stats,
     }

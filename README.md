@@ -28,6 +28,7 @@ statistics, no configuration. The payload is public blocklist data, deduplicated
 | `manifest.json.sig` | Ed25519 signature over `manifest.json` |
 | `index-<version>.bin` | full sorted index of 64-bit domain hashes |
 | `delta-<from>-<to>.bin.gz` | additions and removals since the previous bundle |
+| `resolvers.json` | public DNS resolver IPs the app routes into its VPN tunnel and filters directly, so a browser/app that brings its own resolver doesn't bypass everything. Unioned client-side with a small built-in seed list — this file only ever adds to that floor, never replaces it. |
 
 Clients apply the delta and fall back to the full index only on first sync or if the chain breaks.
 
