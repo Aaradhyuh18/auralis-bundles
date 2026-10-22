@@ -46,6 +46,25 @@ MASK64 = 0xFFFFFFFFFFFFFFFF
 # An upstream outage returning an empty file must not become a bundle that stops blocking.
 SANITY_FLOOR = 0.80
 
+# --- source cache -------------------------------------------------------------------------------
+# Added 2026-10-22 after the University of Toulouse site went down (the whole /blacklists/ tree
+# returned 404 during their security maintenance) and the daily build failed. One source being
+# unreachable for a few days must not stop updates for the others, so each source's last good
+# download is kept in a cache directory (the workflow persists it with actions/cache) and used when
+# a fresh download fails.
+#
+# Guard rails, because a silent stale source is its own kind of failure:
+#   * a cached copy older than CACHE_MAX_AGE_DAYS is NOT used - the build fails loudly instead, so a
+#     source that is really gone surfaces as an email rather than slowly rotting;
+#   * a fresh download with fewer than CACHE_MIN_RATIO of the cached entry count is treated as broken
+#     and the cache is used (and not overwritten), so a truncated or emptied upstream file can't
+#     poison the cache;
+#   * the cached payload's SHA-256 is verified before use;
+#   * every fallback is printed as a GitHub ::warning:: and recorded in the manifest's "sources".
+# SANITY_FLOOR above still applies to the final union either way.
+CACHE_MAX_AGE_DAYS = 30
+CACHE_MIN_RATIO = 0.5
+
 SOURCES = [
     (
         "hagezi-nsfw",
@@ -160,12 +179,14 @@ def parse_host(line: str) -> str | None:
     return host
 
 
-def fetch(url: str, kind: str) -> list[str]:
+def download(url: str) -> bytes:
     print(f"  fetching {url}", flush=True)
     request = urllib.request.Request(url, headers={"User-Agent": "auralis-guard-bundler"})
     with urllib.request.urlopen(request, timeout=300) as response:
-        payload = response.read()
+        return response.read()
 
+
+def parse_payload(payload: bytes, kind: str) -> list[str]:
     if kind == "text":
         return payload.decode("utf-8", "replace").splitlines()
 
@@ -180,20 +201,117 @@ def fetch(url: str, kind: str) -> list[str]:
     raise ValueError(f"unknown source kind: {kind}")
 
 
-def build_union() -> tuple[set[int], list[dict]]:
+def count_hosts(lines: list[str]) -> int:
+    return sum(1 for line in lines if parse_host(line))
+
+
+def _cache_paths(cache_dir: Path, name: str) -> tuple[Path, Path]:
+    return cache_dir / f"{name}.payload", cache_dir / f"{name}.meta.json"
+
+
+def save_cache(cache_dir: Path, name: str, url: str, payload: bytes, entries: int) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload_path, meta_path = _cache_paths(cache_dir, name)
+    meta = {
+        "url": url,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "entries": entries,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    # Write to temporary names and rename, payload before meta, so an interrupted run can never
+    # leave metadata that describes a payload which isn't there.
+    payload_tmp = payload_path.with_name(payload_path.name + ".tmp")
+    payload_tmp.write_bytes(payload)
+    os.replace(payload_tmp, payload_path)
+    meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+    meta_tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(meta_tmp, meta_path)
+
+
+def load_cache(cache_dir: Path | None, name: str) -> tuple[bytes, dict] | None:
+    """The cached payload and its metadata, or None if absent or failing its integrity check."""
+    if cache_dir is None:
+        return None
+    payload_path, meta_path = _cache_paths(cache_dir, name)
+    try:
+        meta = json.loads(meta_path.read_text())
+        payload = payload_path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != meta["sha256"]:
+            print(f"  cache for {name} failed its checksum; ignoring it", file=sys.stderr, flush=True)
+            return None
+        datetime.fromisoformat(meta["fetched_at"])
+        int(meta["entries"])
+        return payload, meta
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def load_source(name: str, url: str, kind: str, cache_dir: Path | None) -> tuple[list[str], dict]:
+    """
+    Lines for one source, plus info about how they were obtained: {"fallback": False} normally, or
+    {"fallback": True, "stale_days": N, "reason": "..."} when the cached copy was used instead.
+    """
+    cached = load_cache(cache_dir, name)
+    try:
+        payload = download(url)
+        lines = parse_payload(payload, kind)
+        entries = count_hosts(lines)
+        if entries == 0:
+            raise RuntimeError("download parsed to zero entries")
+        if cached and entries < int(cached[1]["entries"]) * CACHE_MIN_RATIO:
+            raise RuntimeError(
+                f"download has {entries:,} entries vs {int(cached[1]['entries']):,} cached; treating as broken"
+            )
+        if cache_dir is not None:
+            save_cache(cache_dir, name, url, payload, entries)
+        return lines, {"fallback": False}
+    except Exception as error:  # noqa: BLE001 - any failure here means "use the cache or fail loudly"
+        failure = error
+
+    if cached is None:
+        raise RuntimeError(f"{name}: download failed ({failure}) and there is no usable cached copy") from failure
+
+    payload, meta = cached
+    age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(meta["fetched_at"])).days
+    if age_days > CACHE_MAX_AGE_DAYS:
+        raise RuntimeError(
+            f"{name}: download failed ({failure}) and the cached copy is {age_days} days old "
+            f"(limit {CACHE_MAX_AGE_DAYS}); refusing to keep serving it silently"
+        ) from failure
+
+    print(
+        f"::warning title=Source fallback ({name})::download failed ({failure}); "
+        f"using the cached copy from {age_days} day(s) ago",
+        flush=True,
+    )
+    return parse_payload(payload, kind), {
+        "fallback": True,
+        "stale_days": age_days,
+        "reason": str(failure)[:200],
+    }
+
+
+def build_union(cache_dir: Path | None = None) -> tuple[set[int], list[dict]]:
     hashes: set[int] = set()
     stats: list[dict] = []
 
     for name, url, kind in SOURCES:
         before = len(hashes)
         count = 0
-        for line in fetch(url, kind):
+        lines, info = load_source(name, url, kind, cache_dir)
+        for line in lines:
             host = parse_host(line)
             if host:
                 hashes.add(fnv1a64(host))
                 count += 1
-        stats.append({"name": name, "domains": count, "new": len(hashes) - before})
-        print(f"  {name}: {count:,} entries, {len(hashes) - before:,} new", flush=True)
+        entry = {"name": name, "domains": count, "new": len(hashes) - before}
+        if info["fallback"]:
+            # Only present on a fallback day, so a normal manifest is unchanged. The app ignores
+            # unknown keys under "sources".
+            entry.update({"fallback": True, "stale_days": info["stale_days"]})
+        stats.append(entry)
+        suffix = f"  [CACHED, {info['stale_days']}d old]" if info["fallback"] else ""
+        print(f"  {name}: {count:,} entries, {len(hashes) - before:,} new{suffix}", flush=True)
 
     return hashes, stats
 
@@ -248,6 +366,11 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--previous-index", type=Path)
     parser.add_argument("--previous-version", type=int, default=0)
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="directory holding each source's last good download, used if a fresh download fails",
+    )
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -256,7 +379,7 @@ def main() -> int:
         version = args.previous_version + 1  # keep versions strictly monotonic
 
     print("building union", flush=True)
-    hashes, stats = build_union()
+    hashes, stats = build_union(args.cache_dir)
     current = sorted(to_signed(h) for h in hashes)
     print(f"union: {len(current):,} distinct domains", flush=True)
 

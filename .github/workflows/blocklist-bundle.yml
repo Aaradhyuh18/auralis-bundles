@@ -49,6 +49,18 @@ jobs:
             echo "PREV_VERSION=0" >> "$GITHUB_ENV"
           fi
 
+      # Each upstream list's last good download. If a source is unreachable (the University of
+      # Toulouse site was down for security maintenance on 2026-10-22), the build uses its cached copy
+      # for up to 30 days instead of failing, then fails loudly. A rolling key: restore the newest
+      # entry, save a fresh one after every successful run. See tools/build_bundle.py.
+      - name: Restore source cache
+        uses: actions/cache@v4
+        with:
+          path: source-cache
+          key: source-cache-${{ github.run_id }}
+          restore-keys: |
+            source-cache-
+
       - name: Build and sign bundle
         env:
           BUNDLE_SIGNING_KEY: ${{ secrets.BUNDLE_SIGNING_KEY }}
@@ -56,6 +68,7 @@ jobs:
           PREV_INDEX=$(ls previous/index-*.bin 2>/dev/null | head -1 || true)
           python tools/build_bundle.py \
             --out out \
+            --cache-dir source-cache \
             --previous-version "${PREV_VERSION:-0}" \
             ${PREV_INDEX:+--previous-index "$PREV_INDEX"}
 
@@ -75,3 +88,21 @@ jobs:
       - name: Report
         if: failure()
         run: echo "Bundle build failed. Previous release remains current; devices keep their existing list."
+
+      # GitHub switches off scheduled workflows in a public repo after 60 days with no repository
+      # activity, and nothing would fail or email when that happens - devices would just stop
+      # getting updates. Publishing a release is not a commit, so the last commit here was
+      # 2026-09-10 and the schedule was due to be paused around 2026-11-09. When the last commit
+      # is 40+ days old, add an empty one (the same approach as the community keepalive actions).
+      # Runs even if the build failed. A push made with GITHUB_TOKEN does not start another run.
+      - name: Keep the schedule alive
+        if: always()
+        run: |
+          AGE_DAYS=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "last commit is $AGE_DAYS day(s) old"
+          if [ "$AGE_DAYS" -ge 40 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keepalive: GitHub pauses scheduled workflows after 60 days without repository activity"
+            git push origin HEAD:${{ github.event.repository.default_branch }}
+          fi
